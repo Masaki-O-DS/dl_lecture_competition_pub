@@ -5,11 +5,16 @@ from statistics import mode
 
 from PIL import Image
 import numpy as np
-import pandas
+import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from torch.utils.data import random_split, Subset
+
+from transformers import BertTokenizer , BertModel
+from tqdm import tqdm
+import wandb
 
 
 def set_seed(seed):
@@ -21,7 +26,7 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
+#テキストの前処理
 def process_text(text):
     # lowercase
     text = text.lower()
@@ -63,35 +68,32 @@ def process_text(text):
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
+    def __init__(self, df_path, image_dir, device, transform=None, answer=True):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
-        self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
+        self.df = pd.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
+        self.device = device
+        self.vocab_size = 768 #Bertの分散学習の次元数
+        self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        self.bert_model = BertModel.from_pretrained("bert-base-uncased").to(device)
 
         # question / answerの辞書を作成
-        self.question2idx = {}
         self.answer2idx = {}
-        self.idx2question = {}
         self.idx2answer = {}
-
-        # 質問文に含まれる単語を辞書に追加
-        for question in self.df["question"]:
-            question = process_text(question)
-            words = question.split(" ")
-            for word in words:
-                if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
 
         if self.answer:
             # 回答に含まれる単語を辞書に追加
             for answers in self.df["answers"]:
                 for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
-                    if word not in self.answer2idx:
-                        self.answer2idx[word] = len(self.answer2idx)
+                    text = answer["answer"]
+                    text = process_text(text)
+                    if text not in self.answer2idx:
+                        self.answer2idx[text] = len(self.answer2idx)
+            c_map = pd.read_csv("./data/class_mapping.csv")
+            for ans in c_map["answer"]:
+                if ans not in self.answer2idx:
+                    self.answer2idx[ans] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
     def update_dict(self, dataset):
@@ -103,14 +105,12 @@ class VQADataset(torch.utils.data.Dataset):
         dataset : Dataset
             訓練データのDataset
         """
-        self.question2idx = dataset.question2idx
         self.answer2idx = dataset.answer2idx
-        self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
         """
-        対応するidxのデータ（画像，質問，回答）を取得．
+        対応するidxのデータ（画像,質問,回答）を取得
 
         Parameters
         ----------
@@ -128,24 +128,26 @@ class VQADataset(torch.utils.data.Dataset):
         mode_answer_idx : torch.Tensor  (1)
             10人の回答者の回答の中で最頻値の回答のid
         """
+        
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+        question_series = self.df["question"]
+        q = question_series[idx]
+        q_indexes = self.tokenizer.encode(q, add_special_tokens=True, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            output = self.bert_model(q_indexes)
+        question_embedding = output.last_hidden_state[:, 0, :] 
+
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            
+            #質問文１つに対して１つのベクトルでquestionを表している。
+            return image, question_embedding.squeeze(0), torch.Tensor(answers), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            return image, question_embedding.squeeze(0)
 
     def __len__(self):
         return len(self.df)
@@ -155,7 +157,6 @@ class VQADataset(torch.utils.data.Dataset):
 # 簡単にするならBCEを利用する
 def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
     total_acc = 0.
-
     for pred, answers in zip(batch_pred, batch_answers):
         acc = 0.
         for i in range(len(answers)):
@@ -286,28 +287,55 @@ def ResNet18():
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
+class BilinearBlock(nn.Module):
+    def __init__(self, in1, in2, n_answer):
+        super().__init__()
+        self.bilinear = nn.Bilinear(in1, in2, 512)
+        self.linear = nn.Linear(512, n_answer)
+        
+    def forward(self, x1, x2):
+        x = self.bilinear(x1, x2)
+        return self.linear(x)
+
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, bert_output_size: int, n_answer: int): #n_answer=len(dataset.answer2idx)なのでanswer辞書の数
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.resnet = ResNet50()
+        # self.text_encoder = nn.Linear(vocab_size, 512) #torch.nn.Linear(in_features, out_features)
+        #self.vocab_size = vocab_size
+        self.bilinear = BilinearBlock(64, 64, n_answer)
 
-        self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+        self.fc_1 = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
-            nn.Linear(512, n_answer)
+            nn.Dropout(p=0.5),
+            nn.Linear(128, 64)
+        )
+
+        self.fc_2 = nn.Sequential(
+            nn.Linear(768, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(128, 64)
         )
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
-
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
+        # question_feature = self.text_encoder(question)  # テキストの特徴量
+        im = self.fc_1(image_feature)
+        txt = self.fc_2(question)
+        x = self.bilinear(im, txt)
 
         return x
 
+def init_weights(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
 
 # 4. 学習の実装
 def train(model, dataloader, optimizer, criterion, device):
@@ -318,8 +346,8 @@ def train(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
+    for image, question, answers, mode_answer in tqdm(dataloader):
+        image, question, answers, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
@@ -330,13 +358,13 @@ def train(model, dataloader, optimizer, criterion, device):
         optimizer.step()
 
         total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
+        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy　　pred.argmax(1)の１は適用する次元を指定している
         simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
-def eval(model, dataloader, optimizer, criterion, device):
+def eval(model, dataloader, criterion, device):
     model.eval()
 
     total_loss = 0
@@ -345,7 +373,7 @@ def eval(model, dataloader, optimizer, criterion, device):
 
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
+        image, question, answers, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
@@ -353,12 +381,28 @@ def eval(model, dataloader, optimizer, criterion, device):
 
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).mean().item()  # simple accuracy
+        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
+def create_train_valid_datasets(dataset, valid_ratio=0.1):
+    dataset_size = len(dataset)
+    valid_size = int(dataset_size * valid_ratio)
+    train_size = dataset_size - valid_size
+    
+    # ランダムに分割
+    train_dataset, valid_dataset = random_split(dataset, [train_size, valid_size])
+    
+    # 新しいデータセットを作成
+    train_dataset = Subset(dataset, train_dataset.indices)
+    valid_dataset = Subset(dataset, valid_dataset.indices)
+    
+    return train_dataset, valid_dataset
 
 def main():
+
+    wandb.init(project="DL_VQA")
+    
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -366,21 +410,28 @@ def main():
     # dataloader / model
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
-    test_dataset.update_dict(train_dataset)
+    dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", device=device, transform=transform)
+    # 訓練データセットと検証データセットを作成
+    #train_dataset, valid_dataset = create_train_valid_datasets(dataset, valid_ratio=0.1)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", device=device, transform=transform, answer=False)
+    test_dataset.update_dict(dataset)
+    train_dataset, valid_dataset = create_train_valid_datasets(dataset, valid_ratio=0.1)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=258, shuffle=True)
+    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=258, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(bert_output_size=768, n_answer=len(dataset.answer2idx)).to(device)
+    model.apply(init_weights)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 10
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
 
     # train model
     for epoch in range(num_epoch):
@@ -390,6 +441,20 @@ def main():
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
+        with torch.no_grad():
+            valid_loss, valid_acc, valid_simple_acc, valid_time = eval(model, valid_loader, criterion, device)
+            print(f"【{epoch + 1}/{num_epoch}】\n"
+              f"valid time: {valid_time:.2f} [s]\n"
+              f"valid loss: {valid_loss:.4f}\n"
+              f"valid acc: {valid_acc:.4f}\n"
+              f"valid simple acc: {valid_simple_acc:.4f}")
+        training_log = {
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "valid_loss": valid_loss,
+                "valid_acc": valid_acc
+                }
+        wandb.log(training_log)
 
     # 提出用ファイルの作成
     model.eval()
@@ -400,10 +465,13 @@ def main():
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
 
-    submission = [train_dataset.idx2answer[id] for id in submission]
+
+    submission = [dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    np.save("./submission_dir/submission_tokenizer.npy", submission)
+    # np.save("submission_tokenizer.npy", submission)
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
